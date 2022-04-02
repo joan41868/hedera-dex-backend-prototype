@@ -1,5 +1,9 @@
 # Event Indexing / Aggregation (Go Backend)
 
+## Abstract
+
+![](./assets/dex-be-diagram1.png)
+
 ## DB:
 - PostgreSQL - will require us to define a strict schema for upcoming events.
 - MongoDB - not so strict, but also not very scalable. We will start to experience it's bottleneck after 2-3 milion records
@@ -17,13 +21,36 @@ Go Backend
 
 ### Events
 
+We must listen for the following events:
+
+##### Pair Events
+- `Swap` - for each pair; Will help for determining volume and the most-traded pairs.
+- `Mint` - for each pair (add liquidity) - most liquid pairs
+- `Burn` - for each pair (remove liquidity) ?
+- `Sync` - for each pair. Represents update in the reserves of the pair.
+##### Other events
+
+- `PairCreated` - this event should start a new poller for the above events
+- ...
+
+
 ```go
 package hedera_dex_backend
 
-// persistable event, where the payload can be bytes or base64
-type Event struct {
-	Type int // swap, mint, pairCreated, etc.
-	Payload []byte // The data which the event contains
+type EventType int
+
+const (
+	EventTypeSwap EventType = iota
+	EventTypeMint
+	EventTypeBurn
+	EventTypeSync
+	EventTypePairCreated
+	// other notable event types
+)
+
+type AbstractPersistableEvent struct {
+	Type EventType // swap, mint, pairCreated, etc.
+	Payload []byte // The data which the event contains. Byte array can be used for any event type.
 	Created int64 // creation timestamp
 }
 
@@ -32,31 +59,16 @@ type TypedEvent struct {
     Payload interface{} // abstract enough to be able to contain different structures inside. 
 }
 
-// Example payload
+// Example payload - from a Swap event
 type SwapEventPayload struct {
-	From string
-	To string
-	TokenA string
-	TokenB string
-	AmountA float64 // or big.Int
-	AmountB float64 // or big.Int
-}
-
-func (sep *SwapEventPayload) ToBytes() []byte {
-	// conversion to bytes logic here..
-	return []byte{}
-}
-
-func NewSwapEventPayloadFromBytes(b []byte) *SwapEventPayload {
-    // conversion from bytes logic here...
-    return &SwapEventPayload{}
-}
-
-func (e Event) ToTypedEvent() TypedEvent {
-    return TypedEvent{
-		// for the sake of the example, the event type is only 1 - swap
-        Payload: NewSwapEventPayloadFromBytes(e.Payload),
-    }
+	Sender      string
+	Recipient   string
+	
+	Amount0In   float64
+	Amount1In   float64
+	
+	Amount0Out  float64
+	Amount1Out  float64
 }
 ```
 
@@ -65,15 +77,15 @@ Example usage:
 ```go
 
 	swpEvt := &SwapEventPayload{
-		From:    "addr1",
-		To:      "addr2",
-		TokenA:  "tokenA",
-		TokenB:  "tokenB",
-		AmountA: 1.2,
-		AmountB: 2.39,
+		Sender:    "addr1",
+		Recipient: "addr2",
+		Amount0In: 1.2,
+		Amount1In: 2.39,
+		Amount0Out: 3.4,
+		Amount1Out: 4.5,
 	}
 	evt := &Event{
-		Type:    1, // we can imagine type 1 is a swap event for now
+		Type:    EventTypeSwap, // we can imagine type 1 is a swap event for now
 		Payload: swpEvt.ToBytes(),
 		Created: time.Now().Unix(),
 	}
@@ -95,34 +107,47 @@ Example usage:
 -----------------------
 raw_event.out.json:
 ```json
-{"Type":1,"Payload":"XP+BAwEBEFN3YXBFdmVudFBheWxvYWQB/4IAAQYBBEZyb20BDAABAlRvAQwAAQZUb2tlbkEBDAABBlRva2VuQgEMAAEHQW1vdW50QQEIAAEHQW1vdW50QgEIAAAANf+CAQVhZGRyMQEFYWRkcjIBBnRva2VuQQEGdG9rZW5CAfgzMzMzMzPzPwH4H4XrUbgeA0AA","Created":1648822712}
+{"Type":0,"Payload":"cf+BAwEBEFN3YXBFdmVudFBheWxvYWQB/4IAAQYBBlNlbmRlcgEMAAEJUmVjaXBpZW50AQwAAQlBbW91bnQwSW4BCAABCUFtb3VudDFJbgEIAAEKQW1vdW50ME91dAEIAAEKQW1vdW50MU91dAEIAAAAM/+CAQVhZGRyMQEFYWRkcjIB+DMzMzMzM/M/AfgfhetRuB4DQAH4MzMzMzMzC0AB/hJAAA==","Created":1648914703,"Contract":"0xSomeContract"}
 ```
 
 -----------------------
 
 typed_event.out.json:
 ```json
-{"Payload":{"From":"addr1","To":"addr2","TokenA":"tokenA","TokenB":"tokenB","AmountA":1.2,"AmountB":2.39}}
+{"Payload":{"Sender":"addr1","Recipient":"addr2","Amount0In":1.2,"Amount1In":2.39,"Amount0Out":3.4,"Amount1Out":4.5},"Contract":"0xSomeContract"}
+```
+
+SQL queries:
+
+```sql
+/* Assuming 4 is EventTypePairCreated */
+/* This query will give us the latest pairs which were created */
+SELECT * FROM events WHERE eventType = 4 ORDER BY created DESC;
+
+/*  This query will give us the most liquid pairs */
+SELECT COUNT(contractAddress) as cnt, contractAddress WHERE eventType = 1 GROUP BY contractAddress ORDER BY cnt DESC;
 ```
 
 -----------------------
 
 ### Contract
 
-
-`ContractEventListener` - the entity which will poll the contracts for events through the mirror node.
-There can be 1 listener per contract, or 1 per event type. (TODO: pros/cons)
-
 ~~Original idea~~ - posibility to add new contract event listeners dynamically.
 Why was it rejected: overly complex solution, which would require significant development time.
 
 **Current idea** - fixed amount of ContractEventListeners. They can be spawned when the app starts. They can utilize contract topics in order to filter events
 
+`ContractEventListener` - the entity which will poll the contracts for events through the mirror node.
+There should be 1 listener for `PairCreated`, and 3 new listeners(pollers) should be created for each new pair.
+
+
 ```go
 
 package contract_event_listeners
 
-// ContractEventListener is the entity responsible for polling events out of contracts
+type Event interface{}
+
+// IContractEventListener is the entity responsible for polling events out of contracts
 type IContractEventListener interface {
 	ProcessEvent(e Event) error
 	Poll()
@@ -132,7 +157,19 @@ type ContractEventListener struct {
 	// http client for the mirror node
 	// db connection for persisting events
 	// contract address
+	// event topic (optional)
 }
 
 ```
+
+### Queries
+
+GET /pairs - should return all pairs (pools in uniswap)
+
+GET /pairs/{symbol|address} - should return info for specific pair
+
+GET /pairs/top - should return top pairs(pools), ordered by TVL/Volume
+
+
+
 
